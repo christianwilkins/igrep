@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "igrep"
+version = "0.1.0"
+description = "Fast indexed regex prefilter for code search"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Christian Wilkins" }]
+keywords = ["grep", "regex", "search", "index", "developer-tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Text Processing",
+]
+
+[project.scripts]
+igrep = "igrep.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/christianwilkins/igrep"
+Repository = "https://github.com/christianwilkins/igrep"
+Issues = "https://github.com/christianwilkins/igrep/issues"
+
+[tool.setuptools]
+packages = ["igrep"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
