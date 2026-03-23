@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# local index artifacts
+.index-workspace/
+
+# packaging/build artifacts
+build/
+dist/
+*.egg-info/
+
+# virtual envs
+.venv/
+venv/
+
+# os/editor noise
+.DS_Store
+.vscode/
+.idea/
