@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "igrep"
-version = "0.1.1"
+version = "0.2.0"
 description = "Fast indexed regex prefilter for code search"
 requires-python = ">=3.11"
 readme = "README.md"
