@@ -57,7 +57,7 @@ jobs:
       - name: Build standalone binary
         run: |
           python -m pip install --upgrade pip pyinstaller
-          pyinstaller --onefile --name igrep ./igrep/__main__.py
+          pyinstaller --onefile --name igrep -m igrep
 
       - name: Prepare archive (unix)
         if: runner.os != 'Windows'
