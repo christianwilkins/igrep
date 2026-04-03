@@ -1,70 +1,85 @@
 # igrep
 
-`igrep` is a fast local regex prefilter for large codebases.
+`igrep` is an indexed regex search tool for repeated code search.
 
-It builds a trigram index once, then narrows candidate files before running full regex verification. The design follows the same core ideas in Cursor's fast regex write up:
+It builds a trigram index, uses that index to cut candidate files, then runs full regex verification to keep results correct.
 
-- postings file on disk
-- separate sorted lookup table `(hash, offset, length, docfreq)`
-- mmap lookup table in the query process
-- binary search lookup by hash
-- final regex verification for correctness
+## Why use this instead of plain rg
 
-## Why use it
+`rg` is excellent for one shot scans.
 
-`ripgrep` is great, but full scans can stall agent loops in large repos.
-
-`igrep` targets repeated searches where a local index can prune files quickly. For agent workflows, that can cut grep latency from seconds to milliseconds on selective patterns.
+`igrep` is built for repeated searches in the same repo, especially in agent loops. Once an index exists, selective queries are often much faster than full scans.
 
 ## Install
 
-### Option 1: pipx (macOS, Linux, Windows)
+### Linux and macOS binary install
 
 ```bash
-pipx install igrep
+curl -fsSL https://raw.githubusercontent.com/christianwilkins/igrep/main/scripts/install.sh | bash
 ```
 
-### Option 2: uv tool
+### Windows PowerShell install
+
+```powershell
+iwr https://raw.githubusercontent.com/christianwilkins/igrep/main/scripts/install.ps1 -OutFile install-igrep.ps1
+powershell -ExecutionPolicy Bypass -File .\install-igrep.ps1
+```
+
+### pipx from GitHub
 
 ```bash
-uv tool install igrep
+pipx install git+https://github.com/christianwilkins/igrep
 ```
 
-### Option 3: from source
-
-```bash
-git clone https://github.com/christianwilkins/igrep
-cd igrep
-python -m pip install .
-```
-
-## Commands
+## Core commands
 
 ```bash
 igrep build --root <path> --index-dir <path> [--incremental]
-igrep search --pattern <regex> --index-dir <path> [--root <path>] [--ignore-case] [--max-files N] [--files-only] [--line-numbers]
+igrep search --pattern <regex> --index-dir <path> [--root <path>] [--ignore-case] [--max-files N] [--files-only] [--line-numbers] [--jobs N] [--auto-build] [--json]
+igrep rg [PATTERN] [PATH] [-e PATTERN] [-i] [-n] [-l] [-m N] [--index-dir .igrep] [--auto-build] [--jobs N] [--json]
 igrep bench --root <path> --index-dir <path>
 ```
 
-### Typical workflow
+## Fast start
 
 ```bash
+# one time
 igrep build --root . --index-dir .igrep
-igrep search --pattern "build_index|Searcher" --index-dir .igrep --line-numbers
+
+# repeated searches
+igrep rg "build_index|bench_index" . --index-dir .igrep -n
+
+# auto refresh index then search
+igrep rg "TODO|FIXME" . --index-dir .igrep --auto-build -n
 ```
 
-## Index format
+## Replace rg in an agent shell
+
+```bash
+alias rg='igrep rg --index-dir .igrep --auto-build'
+```
+
+This alias supports common rg flags like `-e`, `-i`, `-n`, `-l`, and `-m`.
+
+## Output modes
+
+- default: `path:line` style output
+- `--line-numbers`: `path:line_number:line`
+- `--files-only`: only matching file paths
+- `--json`: structured output for tools and agents
+
+## Index design
 
 `igrep build` writes:
 
-- `metadata.json`: index version, root, per doc metadata
-- `doc_terms.bin`: per doc trigram hash arrays
+- `metadata.json`: version, root, per file metadata
+- `doc_terms.bin`: per file trigram hash arrays
 - `doc_terms_ci.bin`: case folded trigram hash arrays
 - `postings.bin`: delta varint posting lists
-- `lookup.bin`: sorted fixed width lookup records
-- `postings_ci.bin`, `lookup_ci.bin`: case folded versions
+- `lookup.bin`: sorted lookup entries `(hash, offset, length, docfreq)`
+- `postings_ci.bin`, `lookup_ci.bin`: case folded index files
 
-Lookup record layout is 24 bytes little endian:
+Lookup entry layout is 24 bytes little endian:
 
 ```text
 uint64 hash
@@ -73,49 +88,33 @@ uint32 postings_length
 uint32 docfreq
 ```
 
-## Search path
+## Search flow
 
 `igrep search`:
 
 1. extracts required literals from regex
-2. decomposes literals to trigrams
-3. loads posting metadata by mmap binary search
-4. intersects posting lists in ascending `docfreq`
-5. verifies candidates with Python regex
-6. prints rg style lines or files only mode
+2. decomposes those literals to trigrams
+3. looks up posting metadata through mmap binary search
+4. intersects posting lists by ascending doc frequency
+5. verifies candidate files with full regex
+6. renders line or file output
 
-If no safe trigram can be extracted, it falls back to scanning indexed files and prints a warning.
-
-## Benchmarks
-
-Run:
-
-```bash
-igrep bench --root . --index-dir .igrep
-```
-
-The benchmark reports p50 and p95 latency for `igrep` vs `rg` over realistic regex patterns. Results depend on corpus size, cache warmth, and pattern selectivity.
-
-## Limitations
-
-- UTF-8 text only
-- files over 2 MB are skipped
-- regex literal extraction is conservative
-- fallback scans can still happen for very dynamic patterns
+If there is no usable literal plan, it falls back to indexed file scan and prints a warning.
 
 ## Development
 
-Run tests:
-
 ```bash
 python -m unittest discover -s tests -v
-```
-
-Build index in place:
-
-```bash
 python -m igrep build --root . --index-dir .igrep --incremental
+python -m igrep bench --root . --index-dir .igrep
 ```
+
+## Limitations
+
+- UTF-8 text files only
+- files over 2 MB are skipped
+- regex literal extraction is conservative
+- fallback scans still happen for highly dynamic regex
 
 ## License
 
