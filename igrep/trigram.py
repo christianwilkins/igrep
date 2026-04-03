@@ -45,24 +45,77 @@ def extract_literal_groups(pattern: str, ignore_case: bool = False) -> list[list
 
     Each inner list is a conjunction (all literals are required for that branch).
     The outer list is a disjunction (any branch may match).
-
-    For patterns without a clear top-level alternation, this returns one group.
     """
     flags = re.IGNORECASE if ignore_case else 0
     parsed = sre_parse.parse(pattern, flags)
     tokens = list(parsed.data)
 
+    expanded = _expand_literal_alternatives(tokens)
+    if expanded and len(expanded) > 1:
+        groups = []
+        for value in expanded:
+            group = _normalize_literals([value], ignore_case=ignore_case)
+            if group:
+                groups.append(group)
+        if groups:
+            return groups
+
     if len(tokens) == 1 and tokens[0][0] == BRANCH:
         _, branches = tokens[0][1]
-        groups: list[list[str]] = []
+        groups = []
         for branch in branches:
             info = _sequence_info(list(branch))
             group = _normalize_literals([*info.runs, info.concat], ignore_case=ignore_case)
             if group:
                 groups.append(group)
-        return groups
+        if groups:
+            return groups
 
     return [extract_required_literals(pattern, ignore_case=ignore_case)]
+
+
+def _expand_literal_alternatives(tokens: Sequence[tuple[object, object]], max_expansions: int = 128) -> list[str] | None:
+    alternatives = [""]
+
+    for op, arg in tokens:
+        if op == LITERAL:
+            chunk = [chr(arg)]
+        elif op == SUBPATTERN:
+            chunk = _expand_literal_alternatives(list(arg[-1].data), max_expansions=max_expansions)
+            if chunk is None:
+                return None
+        elif op in {MAX_REPEAT, MIN_REPEAT}:
+            min_repeat, max_repeat, subpattern = arg
+            if min_repeat != max_repeat:
+                return None
+            if min_repeat > 8:
+                return None
+            unit = _expand_literal_alternatives(list(subpattern.data), max_expansions=max_expansions)
+            if unit is None:
+                return None
+            chunk = [""]
+            for _ in range(min_repeat):
+                chunk = [left + right for left in chunk for right in unit]
+                if len(chunk) > max_expansions:
+                    return None
+        elif op == BRANCH:
+            _, branches = arg
+            chunk = []
+            for branch in branches:
+                branch_values = _expand_literal_alternatives(list(branch), max_expansions=max_expansions)
+                if branch_values is None:
+                    return None
+                chunk.extend(branch_values)
+                if len(chunk) > max_expansions:
+                    return None
+        else:
+            return None
+
+        alternatives = [left + right for left in alternatives for right in chunk]
+        if len(alternatives) > max_expansions:
+            return None
+
+    return alternatives
 
 
 def _normalize_literals(values: Sequence[str | None], ignore_case: bool) -> list[str]:
