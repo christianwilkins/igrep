@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -17,6 +18,7 @@ from .trigram import extract_literal_groups, hash_token, unique_trigram_hashes
 
 INDEX_VERSION = 1
 MAX_FILE_BYTES = 2 * 1024 * 1024
+POSTING_CACHE_MAX_ENTRIES = 8192
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class BuildStats:
     indexed_files: int
     reused_files: int
     skipped_files: int
+    deleted_files: int
     trigram_terms: int
 
 
@@ -64,7 +67,12 @@ class BenchRow:
     speedup: float
 
 
-def build_index(root: str, index_dir: str, incremental: bool = False) -> BuildStats:
+def build_index(
+    root: str,
+    index_dir: str,
+    incremental: bool = False,
+    changed_paths: set[str] | None = None,
+) -> BuildStats:
     root_path = Path(root).resolve()
     index_path = Path(index_dir).resolve()
     index_path.mkdir(parents=True, exist_ok=True)
@@ -75,47 +83,108 @@ def build_index(root: str, index_dir: str, incremental: bool = False) -> BuildSt
     if incremental:
         previous_docs, old_terms, old_terms_ci = _load_previous_state(index_path)
 
+    normalized_changed = _normalize_changed_paths(changed_paths)
+    if not previous_docs:
+        normalized_changed = None
+
     doc_records: list[DocumentRecord] = []
     doc_terms: list[list[int]] = []
     doc_terms_ci: list[list[int]] = []
     reused_files = 0
     skipped_files = 0
     indexed_files = 0
+    deleted_files = 0
 
-    for relpath, file_path in _iter_files(root_path, index_path):
-        stat_result = file_path.stat()
-        if stat_result.st_size > MAX_FILE_BYTES:
-            skipped_files += 1
-            continue
-        previous = previous_docs.get(relpath)
-        if previous and previous["size"] == stat_result.st_size and previous["mtime_ns"] == stat_result.st_mtime_ns:
-            assert old_terms is not None
-            assert old_terms_ci is not None
-            terms = read_uint64_slice(old_terms, previous["term_offset"], previous["term_count"])
-            terms_ci = read_uint64_slice(old_terms_ci, previous["term_ci_offset"], previous["term_ci_count"])
-            reused_files += 1
-        else:
-            text = _read_text_file(file_path)
-            if text is None:
+    if normalized_changed is not None and incremental:
+        try:
+            index_relative = index_path.relative_to(root_path).as_posix()
+        except ValueError:
+            index_relative = None
+        candidate_relpaths = sorted(set(previous_docs.keys()) | normalized_changed)
+        for relpath in candidate_relpaths:
+            relpath = relpath.strip("/")
+            if not relpath:
+                continue
+            if _is_ignored_relpath(relpath, index_relative):
+                continue
+            previous = previous_docs.get(relpath)
+            file_path = root_path / relpath
+            if not file_path.exists() or not file_path.is_file():
+                if previous is not None:
+                    deleted_files += 1
+                continue
+            if previous is not None and relpath not in normalized_changed:
+                assert old_terms is not None
+                assert old_terms_ci is not None
+                terms = read_uint64_slice(old_terms, previous["term_offset"], previous["term_count"])
+                terms_ci = read_uint64_slice(old_terms_ci, previous["term_ci_offset"], previous["term_ci_count"])
+                reused_files += 1
+                size = int(previous["size"])
+                mtime_ns = int(previous["mtime_ns"])
+            else:
+                stat_result = file_path.stat()
+                if stat_result.st_size > MAX_FILE_BYTES:
+                    skipped_files += 1
+                    continue
+                text = _read_text_file(file_path)
+                if text is None:
+                    skipped_files += 1
+                    continue
+                terms = unique_trigram_hashes(text)
+                terms_ci = unique_trigram_hashes(text.casefold())
+                indexed_files += 1
+                size = stat_result.st_size
+                mtime_ns = stat_result.st_mtime_ns
+
+            doc_terms.append(terms)
+            doc_terms_ci.append(terms_ci)
+            doc_records.append(
+                DocumentRecord(
+                    doc_id=len(doc_records),
+                    relpath=relpath,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    term_offset=0,
+                    term_count=len(terms),
+                    term_ci_offset=0,
+                    term_ci_count=len(terms_ci),
+                )
+            )
+    else:
+        for relpath, file_path in _iter_files(root_path, index_path):
+            stat_result = file_path.stat()
+            if stat_result.st_size > MAX_FILE_BYTES:
                 skipped_files += 1
                 continue
-            terms = unique_trigram_hashes(text)
-            terms_ci = unique_trigram_hashes(text.casefold())
-            indexed_files += 1
-        doc_terms.append(terms)
-        doc_terms_ci.append(terms_ci)
-        doc_records.append(
-            DocumentRecord(
-                doc_id=len(doc_records),
-                relpath=relpath,
-                size=stat_result.st_size,
-                mtime_ns=stat_result.st_mtime_ns,
-                term_offset=0,
-                term_count=len(terms),
-                term_ci_offset=0,
-                term_ci_count=len(terms_ci),
+            previous = previous_docs.get(relpath)
+            if previous and previous["size"] == stat_result.st_size and previous["mtime_ns"] == stat_result.st_mtime_ns:
+                assert old_terms is not None
+                assert old_terms_ci is not None
+                terms = read_uint64_slice(old_terms, previous["term_offset"], previous["term_count"])
+                terms_ci = read_uint64_slice(old_terms_ci, previous["term_ci_offset"], previous["term_ci_count"])
+                reused_files += 1
+            else:
+                text = _read_text_file(file_path)
+                if text is None:
+                    skipped_files += 1
+                    continue
+                terms = unique_trigram_hashes(text)
+                terms_ci = unique_trigram_hashes(text.casefold())
+                indexed_files += 1
+            doc_terms.append(terms)
+            doc_terms_ci.append(terms_ci)
+            doc_records.append(
+                DocumentRecord(
+                    doc_id=len(doc_records),
+                    relpath=relpath,
+                    size=stat_result.st_size,
+                    mtime_ns=stat_result.st_mtime_ns,
+                    term_offset=0,
+                    term_count=len(terms),
+                    term_ci_offset=0,
+                    term_ci_count=len(terms_ci),
+                )
             )
-        )
 
     if old_terms is not None:
         old_terms.close()
@@ -138,7 +207,13 @@ def build_index(root: str, index_dir: str, incremental: bool = False) -> BuildSt
     _atomic_write_bytes(index_path / "metadata.json", json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8"))
 
     trigram_terms = sum(len(terms) for terms in doc_terms)
-    return BuildStats(indexed_files=indexed_files, reused_files=reused_files, skipped_files=skipped_files, trigram_terms=trigram_terms)
+    return BuildStats(
+        indexed_files=indexed_files,
+        reused_files=reused_files,
+        skipped_files=skipped_files,
+        deleted_files=deleted_files,
+        trigram_terms=trigram_terms,
+    )
 
 
 class Searcher:
@@ -157,6 +232,8 @@ class Searcher:
         self.lookup_ci = LookupTable(str(index_path / "lookup_ci.bin"))
         self.postings = open(index_path / "postings.bin", "rb")
         self.postings_ci = open(index_path / "postings_ci.bin", "rb")
+        self._postings_cache: dict[tuple[int, int], list[int]] = {}
+        self._postings_ci_cache: dict[tuple[int, int], list[int]] = {}
 
     def close(self) -> None:
         self.lookup.close()
@@ -164,10 +241,9 @@ class Searcher:
         self.postings.close()
         self.postings_ci.close()
 
-    def search(self, pattern: str, ignore_case: bool = False, max_files: int | None = None) -> SearchOutcome:
+    def search(self, pattern: str, ignore_case: bool = False, max_files: int | None = None, jobs: int = 1) -> SearchOutcome:
         literal_groups = extract_literal_groups(pattern, ignore_case=ignore_case)
         lookup = self.lookup_ci if ignore_case else self.lookup
-        postings_handle = self.postings_ci if ignore_case else self.postings
 
         branch_candidates: list[set[int]] = []
         for literals in literal_groups:
@@ -194,9 +270,9 @@ class Searcher:
                 continue
 
             entries.sort(key=lambda item: item.docfreq)
-            candidate_list = self._load_posting(postings_handle, entries[0])
+            candidate_list = self._load_posting(entries[0], ignore_case=ignore_case)
             for entry in entries[1:]:
-                candidate_list = intersect_postings(candidate_list, self._load_posting(postings_handle, entry))
+                candidate_list = intersect_postings(candidate_list, self._load_posting(entry, ignore_case=ignore_case))
                 if not candidate_list:
                     break
             if candidate_list:
@@ -214,19 +290,10 @@ class Searcher:
 
         flags = re.MULTILINE | (re.IGNORECASE if ignore_case else 0)
         regex = re.compile(pattern, flags)
-        matches: list[str] = []
-        verified_files = 0
-        for doc_id in candidates:
-            relpath = self.documents[doc_id].relpath
-            file_path = self.root / relpath
-            text = _read_text_file(file_path)
-            if text is None:
-                continue
-            verified_files += 1
-            if regex.search(text):
-                matches.append(relpath)
-                if max_files is not None and len(matches) >= max_files:
-                    break
+
+        matches, verified_files = self._verify_candidates(candidates=candidates, regex=regex, jobs=jobs)
+        if max_files is not None:
+            matches = matches[:max_files]
 
         return SearchOutcome(
             matches=matches,
@@ -239,10 +306,57 @@ class Searcher:
             ),
         )
 
-    def _load_posting(self, handle, entry) -> list[int]:
+    def _verify_candidates(self, candidates: list[int], regex: re.Pattern[str], jobs: int) -> tuple[list[str], int]:
+        if jobs <= 1 or len(candidates) <= 1:
+            matches: list[str] = []
+            verified_files = 0
+            for doc_id in candidates:
+                relpath, verified, matched = self._verify_candidate(doc_id, regex)
+                if verified:
+                    verified_files += 1
+                if matched:
+                    matches.append(relpath)
+            return matches, verified_files
+
+        workers = max(1, jobs)
+        matches = []
+        verified_files = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for relpath, verified, matched in executor.map(lambda doc_id: self._verify_candidate(doc_id, regex), candidates):
+                if verified:
+                    verified_files += 1
+                if matched:
+                    matches.append(relpath)
+        return matches, verified_files
+
+    def _verify_candidate(self, doc_id: int, regex: re.Pattern[str]) -> tuple[str, bool, bool]:
+        relpath = self.documents[doc_id].relpath
+        file_path = self.root / relpath
+        text = _read_text_file(file_path)
+        if text is None:
+            return relpath, False, False
+        return relpath, True, regex.search(text) is not None
+
+    def _load_posting(self, entry, ignore_case: bool) -> list[int]:
+        key = (entry.offset, entry.length)
+        if ignore_case:
+            cache = self._postings_ci_cache
+            handle = self.postings_ci
+        else:
+            cache = self._postings_cache
+            handle = self.postings
+
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
         handle.seek(entry.offset)
         data = handle.read(entry.length)
-        return decode_postings(data)
+        decoded = decode_postings(data)
+        if len(cache) >= POSTING_CACHE_MAX_ENTRIES:
+            cache.clear()
+        cache[key] = decoded
+        return decoded
 
 
 def bench_index(root: str, index_dir: str, repetitions: int = 9) -> list[BenchRow]:
@@ -342,7 +456,6 @@ def render_line_matches(
             line_number = text.count("\n", 0, match.start()) + 1
             matched_lines.add(line_number)
         if not matched_lines and regex.search(text):
-            # defensive fallback for zero-width or complex constructs
             matched_lines.add(1)
 
         if not matched_lines:
@@ -359,6 +472,81 @@ def render_line_matches(
                 yield f"{relative_path}:{line_text}"
 
 
+def detect_git_changed_paths(root: str | Path) -> set[str] | None:
+    root_path = Path(root).resolve()
+    if shutil.which("git") is None:
+        return None
+
+    inside = subprocess.run(
+        ["git", "-C", str(root_path), "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return None
+
+    status = subprocess.run(
+        ["git", "-C", str(root_path), "status", "--porcelain=1", "--untracked-files=all"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        return None
+
+    changed: set[str] = set()
+    for raw_line in status.stdout.splitlines():
+        if not raw_line:
+            continue
+        line = raw_line[3:] if len(raw_line) > 3 else ""
+        if not line:
+            continue
+        if " -> " in line:
+            old_path, new_path = line.split(" -> ", 1)
+            changed.add(old_path.replace("\\", "/").strip())
+            changed.add(new_path.replace("\\", "/").strip())
+        else:
+            changed.add(line.replace("\\", "/").strip())
+
+    return _normalize_changed_paths(changed)
+
+
+def scan_file_state(root: str | Path, index_dir: str | Path) -> dict[str, tuple[int, int]]:
+    root_path = Path(root).resolve()
+    index_path = Path(index_dir).resolve()
+    state: dict[str, tuple[int, int]] = {}
+    for relpath, file_path in _iter_files(root_path, index_path):
+        stat_result = file_path.stat()
+        state[relpath] = (stat_result.st_mtime_ns, stat_result.st_size)
+    return state
+
+
+def detect_state_changes(
+    previous_state: dict[str, tuple[int, int]],
+    current_state: dict[str, tuple[int, int]],
+) -> set[str]:
+    changed: set[str] = set()
+    all_paths = set(previous_state) | set(current_state)
+    for relpath in all_paths:
+        if previous_state.get(relpath) != current_state.get(relpath):
+            changed.add(relpath)
+    return changed
+
+
+def _normalize_changed_paths(changed_paths: set[str] | None) -> set[str] | None:
+    if changed_paths is None:
+        return None
+    normalized = {
+        path.replace("\\", "/").strip().strip("/")
+        for path in changed_paths
+        if path.strip()
+    }
+    return normalized
+
+
 def _percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     if not ordered:
@@ -371,20 +559,25 @@ def _percentile(values: list[float], quantile: float) -> float:
 
 def _iter_files(root: Path, index_path: Path) -> Iterable[tuple[str, Path]]:
     try:
-        index_relative = index_path.relative_to(root)
+        index_relative = index_path.relative_to(root).as_posix()
     except ValueError:
         index_relative = None
+
     for file_path in sorted(root.rglob("*")):
         if not file_path.is_file():
             continue
         relpath = file_path.relative_to(root).as_posix()
-        if relpath.startswith(".git/"):
-            continue
-        if index_relative is not None and relpath == index_relative.as_posix():
-            continue
-        if index_relative is not None and relpath.startswith(index_relative.as_posix().rstrip("/") + "/"):
+        if _is_ignored_relpath(relpath, index_relative):
             continue
         yield relpath, file_path
+
+
+def _is_ignored_relpath(relpath: str, index_relative: str | None) -> bool:
+    if relpath.startswith(".git/"):
+        return True
+    if index_relative is None:
+        return False
+    return relpath == index_relative or relpath.startswith(index_relative.rstrip("/") + "/")
 
 
 def _read_text_file(path: Path) -> str | None:
